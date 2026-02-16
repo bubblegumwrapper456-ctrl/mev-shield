@@ -1,0 +1,40 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model WalletReport {
+  id              String   @id @default(cuid())
+  wallet          String   @unique
+  attackCount     Int
+  totalLossLamports BigInt
+  totalLossUSD    Float
+  reportData      Json
+  analyzedAt      DateTime @default(now())
+  expiresAt       DateTime
+}
+
+model SandwichAttack {
+  id                String   @id @default(cuid())
+  victimWallet      String
+  attackerWallet    String
+  slot              BigInt
+  pool              String
+  tokenMint         String
+  tokenSymbol       String?
+  victimTxSig       String
+  frontrunTxSig     String
+  backrunTxSig      String
+  lossLamports      BigInt
+  lossUSD           Float
+  botProfitLamports BigInt
+  dex               String
+  detectedAt        DateTime @default(now())
+
+  @@index([victimWallet])
+  @@index([attackerWallet])
+}
