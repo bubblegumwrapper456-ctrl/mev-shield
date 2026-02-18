@@ -23,26 +23,246 @@ const SYSTEM_PROGRAMS = new Set([
   'Memo1UhkJBfCR6MNB3fhkQLbbp5Z9QpKET4gGJQzPDB',
 ]);
 
+// Helius Enhanced API (GET per-wallet endpoint — pre-parsed, efficient)
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY
+  || process.env.SOLANA_RPC_URL?.match(/api-key=([^&]+)/)?.[1]
+  || '';
+const HELIUS_WALLET_TX_URL = `https://api.helius.xyz/v0/addresses`;
+
 async function retryWithBackoff<T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (error) {
-      const isRateLimit = error instanceof Error && error.message.includes('429');
+      const isRateLimit = error instanceof Error && (
+        error.message.includes('429') || error.message.includes('Too Many')
+      );
       if (!isRateLimit || attempt === maxRetries) throw error;
       const delay = Math.pow(2, attempt + 1) * 1000;
-      console.log(`[RPC] Rate limited, retrying in ${delay}ms...`);
+      console.log(`[Helius] Rate limited, retrying in ${delay}ms...`);
       await new Promise(r => setTimeout(r, delay));
     }
   }
   throw new Error('Retry failed');
 }
 
+// --- Helius Enhanced API response type ---
+
+interface HeliusWalletTx {
+  signature: string;
+  type: string;
+  source: string;
+  fee: number;
+  feePayer: string;
+  slot: number;
+  timestamp: number;
+  nativeTransfers?: Array<{
+    fromUserAccount: string;
+    toUserAccount: string;
+    amount: number;
+  }>;
+  tokenTransfers: Array<{
+    fromUserAccount: string;
+    toUserAccount: string;
+    fromTokenAccount: string;
+    toTokenAccount: string;
+    tokenAmount: number;
+    mint: string;
+  }>;
+  accountData: Array<{
+    account: string;
+    nativeBalanceChange: number;
+    tokenBalanceChanges: Array<{
+      userAccount: string;
+      tokenAccount: string;
+      mint: string;
+      rawTokenAmount: { tokenAmount: string; decimals: number };
+    }>;
+  }>;
+}
+
 /**
- * Fetch recent swap transactions for a wallet using Solana RPC.
- * Uses balance-change-based detection: any tx with opposing token changes is a swap.
+ * Fetch recent swap transactions for a wallet using the Helius Enhanced API.
+ * Uses GET /v0/addresses/{wallet}/transactions — returns pre-parsed data
+ * with type, source, tokenTransfers, and accountData in one shot.
+ *
+ * Much more efficient than individual getParsedTransaction RPC calls:
+ * - 100 txs per page vs 1 tx at a time
+ * - Pre-classified type/source fields (no manual DEX detection needed)
+ * - No per-tx RPC credit cost
  */
 export async function fetchWalletSwapsViaRPC(wallet: string): Promise<SwapTransaction[]> {
+  if (!HELIUS_API_KEY) {
+    console.warn('[Helius] No API key found, falling back to RPC');
+    return fetchWalletSwapsViaRPCFallback(wallet);
+  }
+
+  const cutoffTimestamp = Math.floor(Date.now() / 1000) - (ANALYSIS_WINDOW_DAYS * 24 * 60 * 60);
+  const swaps: SwapTransaction[] = [];
+  let before: string | undefined;
+  const MAX_PAGES = 5;
+  const MAX_SWAPS = 80;
+
+  console.log(`[Helius] Fetching wallet transactions via enhanced API for ${wallet}`);
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const url = `${HELIUS_WALLET_TX_URL}/${wallet}/transactions?api-key=${HELIUS_API_KEY}&limit=100${before ? `&before=${before}` : ''}`;
+
+    let txns: HeliusWalletTx[];
+    try {
+      txns = await retryWithBackoff(async () => {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        return r.json() as Promise<HeliusWalletTx[]>;
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes('429')) {
+        console.log('[Helius] Rate limited on page fetch, waiting 5s...');
+        await new Promise(r => setTimeout(r, 5000));
+        page--; // retry this page
+        continue;
+      }
+      console.error(`[Helius] Failed to fetch page ${page}: ${msg}`);
+      break;
+    }
+
+    if (txns.length === 0) break;
+
+    for (const tx of txns) {
+      // Stop if we've gone past the analysis window
+      if (tx.timestamp && tx.timestamp < cutoffTimestamp) {
+        console.log(`[Helius] Reached analysis window cutoff at page ${page}`);
+        return swaps;
+      }
+
+      if (tx.type !== 'SWAP') continue;
+
+      const swap = parseHeliusWalletSwap(tx, wallet);
+      if (swap) {
+        swaps.push(swap);
+        if (swaps.length >= MAX_SWAPS) {
+          console.log(`[Helius] Reached ${MAX_SWAPS} swap limit`);
+          return swaps;
+        }
+      }
+    }
+
+    before = txns[txns.length - 1].signature;
+    if (txns.length < 100) break;
+    await new Promise(r => setTimeout(r, 500)); // respect rate limits
+  }
+
+  console.log(`[Helius] Parsed ${swaps.length} swaps via enhanced API`);
+  return swaps;
+}
+
+/**
+ * Parse a swap from a Helius enhanced wallet transaction.
+ * Uses accountData balance changes (same approach as sandwich-detector's parseHeliusSwap).
+ */
+function parseHeliusWalletSwap(
+  tx: HeliusWalletTx,
+  wallet: string,
+): SwapTransaction | null {
+  const signer = tx.feePayer;
+  const solMint = 'So11111111111111111111111111111111111111112';
+
+  // Get balance changes for the wallet (signer)
+  const signerAccount = tx.accountData.find(a => a.account === wallet);
+  const signerChanges = signerAccount?.tokenBalanceChanges || [];
+  const nativeChange = signerAccount?.nativeBalanceChange || 0;
+
+  const nonSolChanges: { mint: string; change: number }[] = [];
+
+  for (const tbc of signerChanges) {
+    const amount = Number(tbc.rawTokenAmount.tokenAmount);
+    if (amount !== 0 && tbc.mint !== solMint) {
+      nonSolChanges.push({ mint: tbc.mint, change: amount });
+    }
+  }
+
+  // Fallback: infer from tokenTransfers if no balance changes on signer
+  if (nonSolChanges.length === 0) {
+    const received = new Map<string, number>();
+    const sent = new Map<string, number>();
+    for (const tt of tx.tokenTransfers) {
+      if (tt.mint === solMint) continue;
+      if (tt.toUserAccount === wallet) {
+        received.set(tt.mint, (received.get(tt.mint) || 0) + tt.tokenAmount);
+      }
+      if (tt.fromUserAccount === wallet) {
+        sent.set(tt.mint, (sent.get(tt.mint) || 0) + tt.tokenAmount);
+      }
+    }
+    for (const [mint, amount] of received) {
+      const net = amount - (sent.get(mint) || 0);
+      if (net !== 0) nonSolChanges.push({ mint, change: net });
+    }
+    for (const [mint, amount] of sent) {
+      if (!received.has(mint)) nonSolChanges.push({ mint, change: -amount });
+    }
+  }
+
+  if (nonSolChanges.length === 0) return null;
+
+  // Primary token = largest absolute change
+  const primaryToken = nonSolChanges.reduce((max, c) =>
+    Math.abs(c.change) > Math.abs(max.change) ? c : max
+  );
+
+  const tokenMint = primaryToken.mint;
+  let direction: 'buy' | 'sell';
+  let amountIn: bigint;
+  let amountOut: bigint;
+
+  if (primaryToken.change > 0) {
+    direction = 'buy';
+    amountOut = BigInt(Math.round(primaryToken.change));
+    const spent = nonSolChanges.find(c => c.change < 0);
+    amountIn = spent
+      ? BigInt(Math.round(Math.abs(spent.change)))
+      : BigInt(Math.abs(Math.min(nativeChange, 0)));
+  } else {
+    direction = 'sell';
+    amountIn = BigInt(Math.round(Math.abs(primaryToken.change)));
+    const gained = nonSolChanges.find(c => c.change > 0 && c.mint !== primaryToken.mint);
+    amountOut = gained
+      ? BigInt(Math.round(gained.change))
+      : BigInt(Math.max(nativeChange, 0));
+  }
+
+  // Derive pool: find non-signer account with token balance changes
+  let pool = `slot-${tx.slot}`;
+  for (const ad of tx.accountData) {
+    if (ad.account === wallet) continue;
+    if (ad.tokenBalanceChanges.length > 0) {
+      pool = ad.account;
+      break;
+    }
+  }
+
+  return {
+    signature: tx.signature,
+    slot: tx.slot,
+    slotIndex: 0, // will be re-computed during block analysis
+    pool,
+    tokenMint,
+    tokenSymbol: KNOWN_TOKENS[tokenMint]?.symbol,
+    direction,
+    amountIn,
+    amountOut,
+    signer,
+    timestamp: tx.timestamp || Math.floor(Date.now() / 1000),
+    dex: tx.source || 'Unknown',
+  };
+}
+
+/**
+ * Fallback: Fetch swaps via individual RPC getParsedTransaction calls.
+ * Used only when Helius API key is not available.
+ */
+async function fetchWalletSwapsViaRPCFallback(wallet: string): Promise<SwapTransaction[]> {
   const conn = getConnection();
   const pubkey = new PublicKey(wallet);
   const cutoffTimestamp = Math.floor(Date.now() / 1000) - (ANALYSIS_WINDOW_DAYS * 24 * 60 * 60);
